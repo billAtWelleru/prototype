@@ -3,6 +3,8 @@ const $ = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
 
 const App = {
+  // set true during development to unlock extra features
+  debug: false,
   state: JSON.parse(localStorage.getItem('welleru_mobile')||'{}'),
   init(){
     // make sure collections exist
@@ -20,8 +22,38 @@ const App = {
     $('#closeMenu').addEventListener('click', ()=>{ $('#sideMenu').hidden=true; });
     $('#contrastToggle').addEventListener('click', ()=>{ document.documentElement.classList.toggle('high-contrast'); });
     $('#logoutBtn').addEventListener('click', ()=>{ this.state.user=null; this.persist(); this.refreshAuth(); location.hash='#login'; });
+
+    // debug dump option
+    const dbg = $('#debugDump');
+    if(dbg){
+      dbg.addEventListener('click', e=>{
+        e.preventDefault();
+        console.log('Localstorage state:', JSON.stringify(this.state, null, 2));
+      });
+    }
+
+    // reset prototype
+    const reset = $('#resetBtn');
+    if(reset){
+      reset.addEventListener('click', e=>{
+        e.preventDefault();
+        if(confirm('This will erase all stored data and log you out. Continue?')){
+          localStorage.clear();
+          location.hash='#login';
+          location.reload();
+        }
+      });
+    }
   },
-  refreshAuth(){ $$('.authed').forEach(el=>el.hidden=!this.authed()); },
+  refreshAuth(){
+    $$('.authed').forEach(el=>{
+      if(el.id==='debugDump' && !this.debug){
+        el.hidden = true;
+      } else {
+        el.hidden = !this.authed();
+      }
+    });
+  },
   route(){
     const r = (location.hash.slice(1)||'login');
     const views = { login:Views.Login, signup:Views.Signup, 'signup-phone':Views.SignupPhone, 'signup-mfa':Views.SignupMFA, 'signup-payor':Views.SignupPayor, 'signup-amazon':Views.SignupAmazon, mfa:Views.MFA, dashboard:Views.Dashboard, pcp:Views.PCP, hra:Views.HRA, appointment:Views.Appointment, awv:Views.AWV, rewards:Views.Rewards, profile:Views.Profile, celebration:Views.Celebration };
@@ -257,35 +289,48 @@ const Views = {
     }
   },
   SignupPayor:{
-    render(){return `
+    render(){
+      const payor = App.state.signupSession?.payor;
+      return `
       <section class='card'>
         <div class='h1'>Connect with Payor</div>
         <p>Enter your plan information to locate your account.</p>
+        ${!payor ? `
         <form id='payor-form' class='grid'>
           <label class='form-row'>Plan ID (6 digits)<input class='input' name='plan' type='text' placeholder='XXX-XXX' required></label>
           <label class='form-row'>Group ID (6 digits)<input class='input' name='group' type='text' placeholder='XXX-XXX' required></label>
           <label class='form-row'>Date of Birth<input class='input' name='dob' type='date' required></label>
           <button class='btn' type='submit'>Submit</button>
-        </form>
-      </section>`;},
+        </form>` : `
+        <p><strong>Payor identified:</strong> ${payor}</p>
+        <button id='confirmPayor' class='btn'>Confirm Payor</button>`}
+      </section>`;
+    },
     bind(){
-      const form = $('#payor-form');
-      form.addEventListener('submit', e=>{
-        e.preventDefault();
-        const fd = new FormData(form);
-        App.state.signupSession.plan = fd.get('plan');
-        App.state.signupSession.group = fd.get('group');
-        App.state.signupSession.dob = fd.get('dob');
-        App.persist();
-        
-        // Show payor confirmation
-        const payors = ['Cascade Health Plan', 'Evergreen Benefit Alliance', 'SummitCare Insurance'];
-        const selectedPayor = payors[Math.floor(Math.random()*payors.length)];
-        App.state.signupSession.payor = selectedPayor;
-        App.persist();
-        
-        location.hash='#signup-amazon';
-      });
+      const payor = App.state.signupSession?.payor;
+      if(!payor){
+        const form = $('#payor-form');
+        form.addEventListener('submit', e=>{
+          e.preventDefault();
+          const fd = new FormData(form);
+          App.state.signupSession.plan = fd.get('plan');
+          App.state.signupSession.group = fd.get('group');
+          App.state.signupSession.dob = fd.get('dob');
+          App.persist();
+          
+          // Show payor confirmation
+          const payors = ['Cascade Health Plan', 'Evergreen Benefit Alliance', 'SummitCare Insurance'];
+          const selectedPayor = payors[Math.floor(Math.random()*payors.length)];
+          App.state.signupSession.payor = selectedPayor;
+          App.persist();
+          // re-render current view so user can confirm
+          App.route();
+        });
+      } else {
+        $('#confirmPayor').addEventListener('click', ()=>{
+          location.hash='#signup-amazon';
+        });
+      }
     }
   },
   SignupAmazon:{
@@ -346,8 +391,12 @@ const Views = {
   },
   Dashboard:{
     render(){
-      const j=App.state.user?.journey||{}; const pct=Math.round(((j.m1+j.m2+j.m3+j.m4+j.m5)/5)*100);
+      const j=App.state.user?.journey||{};
+      const pct=Math.round(((j.m1+j.m2+j.m3+j.m4+j.m5)/5)*100);
       const next=!j.m2?'#pcp':!j.m3?'#hra':!j.m4?'#appointment':!j.m5?'#awv':'#rewards';
+      const names = {M1:'Create Account',M2:'Select PCP',M3:'Complete HRA',M4:'Make Appointment',M5:'Complete AWV',default:'View Rewards'};
+      const nextKey = !j.m2 ? 'M2' : !j.m3 ? 'M3' : !j.m4 ? 'M4' : !j.m5 ? 'M5' : 'default';
+      const nextName = names[nextKey];
       const earn=(j.m1?5:0)+(j.m2?5:0)+(j.m3?5:0)+(j.m4?10:0)+(j.m5?50:0);
       return `
         <section class='card'>
@@ -365,21 +414,10 @@ const Views = {
             <li>M5: Complete AWV ${j.m5?'✅':''}</li>
           </ol>
         </section>
-        <a class='btn' href='${next}'>Continue</a>
-        <div style='margin-top:2rem; margin-bottom:1rem;'>
-          <p style='font-size:0.85rem; color:#666; margin:0 0 1rem 0;'>To reset the prototype, click 'Clear All Data'</p>
-          <button id='clearData' class='btn ghost'>Clear All Data</button>
-        </div>`;
+        <a class='btn' href='${next}'>Continue${nextName?': '+nextName:''}</a>`;
     },
     bind(){
-      // existing functionality left untouched
-      $('#clearData').addEventListener('click',()=>{
-        if(confirm('This will erase all stored data and log you out. Continue?')){
-          localStorage.clear();
-          location.hash='#login';
-          location.reload();
-        }
-      });
+      // nothing to bind for dashboard now
     }
   },
   PCP:{
