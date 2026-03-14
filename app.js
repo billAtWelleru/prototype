@@ -4,12 +4,17 @@ const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
 
 const App = {
   // set true during development to unlock extra features
-  debug: false,
+  debug: true,
   state: JSON.parse(localStorage.getItem('welleru_mobile')||'{}'),
   init(){
     // make sure collections exist
     this.state.celebrated = this.state.celebrated || {}; // M1..M5
     this.state.users = this.state.users || {};      // stored accounts by email
+    // set language to english for unauthenticated users
+    if(!this.authed()){
+      this.state.language = 'en';
+      this.persist();
+    }
     this.bindChrome();
     this.route();
     window.addEventListener('hashchange', ()=>this.route());
@@ -153,9 +158,25 @@ const App = {
     return dict[lang] && dict[lang][key] ? dict[lang][key] : key;
   },
   bindChrome(){
-    $('#menuToggle').addEventListener('click', ()=>{ $('#sideMenu').hidden=false; });
-    $('#closeMenu').addEventListener('click', ()=>{ $('#sideMenu').hidden=true; });
+    const sideMenu = $('#sideMenu');
+    $('#menuToggle').addEventListener('click', ()=>{ sideMenu.hidden=false; });
+    $('#closeMenu').addEventListener('click', ()=>{ sideMenu.hidden=true; });
     $('#contrastToggle').addEventListener('click', ()=>{ document.documentElement.classList.toggle('high-contrast'); });
+
+    // close the side menu when selecting an item
+    sideMenu.addEventListener('click', e=>{
+      const target = e.target.closest('a, button');
+      if(target && target.id !== 'closeMenu'){
+        sideMenu.hidden = true;
+      }
+    });
+
+    // close the side menu when clicking outside of it
+    document.addEventListener('click', e=>{
+      if(!sideMenu.hidden && !sideMenu.contains(e.target) && e.target.id !== 'menuToggle'){
+        sideMenu.hidden = true;
+      }
+    });
 
     // language toggle
     const langBtn = $('#languageToggle');
@@ -194,8 +215,10 @@ const App = {
     if(reset){
       reset.addEventListener('click', e=>{
         e.preventDefault();
-        if(confirm('This will erase all stored data and log you out. Continue?')){
-          localStorage.clear();
+        if(confirm('This will erase all stored data including other user accounts and log you out. Continue?')){
+          localStorage.removeItem('welleru_mobile');
+          App.state = { celebrated: {}, users: {}, user: null, language: 'en' };
+          App.persist();
           location.hash='#login';
           location.reload();
         }
@@ -203,16 +226,58 @@ const App = {
     }
   },
   refreshAuth(){
+    const authed = this.authed();
+    if(this.state.user){
+      this.state.pcpName = this.state.user.pcp || this.state.pcpName || '';
+      this.state.pcpCity = this.state.user.pcpCity || this.state.pcpCity || '';
+    }
+    // menu items that carry the "authed" class are usually hidden when
+    // the user is not signed in.  There are two special cases:
+    //   * resetBtn is always visible
+    //   * debugDump is strictly gated by the debug flag; it never appears
+    //     unless the prototype is running in debug mode.
     $$('.authed').forEach(el=>{
-      if(el.id==='debugDump' && !this.debug){
-        el.hidden = true;
+      if(el.id === 'debugDump'){
+        // show dump option only when debugging is enabled
+        el.hidden = !this.debug;
+      } else if(el.id === 'resetBtn'){
+        // reset remains visible in all states
+        el.hidden = false;
       } else {
-        el.hidden = !this.authed();
+        // everything else tagged authed requires an authenticated session
+        el.hidden = !authed;
+      }
+    });
+
+    // the standalone login link isn't part of the authed set, so hide it
+    // once the user is signed in so the menu only shows the relevant items.
+    const loginLink = $('#sideMenu a[href="#login"]');
+    if(loginLink) loginLink.hidden = authed;
+
+    // also control bottom tab visibility
+    $$('.tab').forEach(el=>{
+      el.hidden = !authed;
+    });
+
+    // hide side menu items that are explicitly disabled
+    $$('#sideMenu .item').forEach(item=>{
+      const enabled = item.getAttribute('data-enabled');
+      if(enabled === 'false'){
+        item.hidden = true;
       }
     });
   },
   route(){
     const r = (location.hash.slice(1)||'login');
+    // only allow unauthenticated users to see login, signup, and signup-* screens
+    if(!this.authed()){
+      const allowedUnauthenticated = ['login', 'signup', 'signup-phone', 'signup-mfa', 'signup-payor', 'signup-amazon'];
+      if(!allowedUnauthenticated.includes(r)){
+        // force back to login if trying to access protected routes
+        location.hash = '#login';
+        return;
+      }
+    }
     // reset to english when showing login screen
     if(r==='login'){
       this.state.language = 'en';
@@ -351,7 +416,9 @@ const Views = {
         }
         // always succeed regardless of password
         App.state.user = users[email];
-        // remember language for login screen when logged out
+        // restore user-specific PCP and language
+        App.state.pcpName = App.state.user.pcp || App.state.pcpName || '';
+        App.state.pcpCity = App.state.user.pcpCity || App.state.pcpCity || '';
         App.state.language = App.state.user.lang || App.state.language;
         App.persist();
         location.hash='#mfa';
@@ -472,7 +539,10 @@ const Views = {
           <button class='btn' type='submit'>${App.t('Submit')}</button>
         </form>` : `
         <p><strong>${App.t('Payor identified:')}</strong> ${payor}</p>
-        <button id='confirmPayor' class='btn'>${App.t('Confirm Payor')}</button>`}
+        <div class='grid'>
+          <button id='confirmPayor' class='btn'>${App.t('Confirm Payor')}</button>
+          <button id='changePayor' class='btn ghost'>${App.t('Back')}</button>
+        </div>`}
       </section>`;
     },
 
@@ -499,6 +569,11 @@ const Views = {
       } else {
         $('#confirmPayor').addEventListener('click', ()=>{
           location.hash='#signup-amazon';
+        });
+        $('#changePayor').addEventListener('click', ()=>{
+          delete App.state.signupSession.payor;
+          App.persist();
+          App.route();
         });
       }
     }
@@ -557,11 +632,13 @@ const Views = {
     }
   },
   MFA:{
-    render(){return `
+    render(){
+      const mfaCode = String(Math.floor(Math.random()*1000000)).padStart(6,'0');
+      return `
       <section class='card'>
         <div class='h1'>Multi‑Factor Authentication</div>
         <form id='mf' class='grid'>
-          <label class='form-row'>Enter 6‑digit code<input class='input' name='code' pattern='\\d{6}' maxlength='6' required></label>
+          <label class='form-row'>Enter 6‑digit code<input class='input' name='code' pattern='\\d{6}' maxlength='6' value='${mfaCode}' required></label>
           <button class='btn' type='submit'>Verify</button>
         </form>
       </section>`;},
@@ -602,6 +679,26 @@ const Views = {
     render(){ 
       const cur=App.state.pcpName||'No PCP on file'; 
       const hasProvider = !!App.state.pcpName;
+      const candidate = App.pcpCandidate;
+      const providers=[
+        {name:'Dr. Lee',specialty:'Family Medicine',city:'Grapevine',phone:'(555) 123-4567'},
+        {name:'Dr. Patel',specialty:'Internal Medicine',city:'Dallas',phone:'(555) 987-6543'},
+        {name:'Dr. Garcia',specialty:'Family Medicine',city:'Irving',phone:'(555) 456-7890'}
+      ];
+
+      if(candidate){
+        return `
+        <section class='card'>
+          <div class='h1'>${App.t('Primary Care Provider')}</div>
+          <p>${App.t('Selected provider:')}</p>
+          <p><strong>${candidate.name}</strong><br>${candidate.specialty}<br>${candidate.city}<br>${candidate.phone}</p>
+          <div class='grid'>
+            <button id='pcpConfirm' class='btn'>Confirm</button>
+            <button id='pcpBack' class='btn ghost'>Back</button>
+          </div>
+        </section>`;
+      }
+
       return `
       <section class='card'>
         <div class='h1'>${App.t('Primary Care Provider')}</div>
@@ -616,11 +713,45 @@ const Views = {
         </div>
       </section>`;},
     bind(){
-      const hasProvider = !!App.state.pcpName;
-      const alreadyRewarded = App.state.user.journey.m2;
+      const alreadyRewarded = !!App.state.user?.journey?.m2;
+      const providers=[
+        {name:'Dr. Lee',specialty:'Family Medicine',city:'Grapevine',phone:'(555) 123-4567'},
+        {name:'Dr. Patel',specialty:'Internal Medicine',city:'Dallas',phone:'(555) 987-6543'},
+        {name:'Dr. Garcia',specialty:'Family Medicine',city:'Irving',phone:'(555) 456-7890'}
+      ];
+
+      if(App.pcpCandidate){
+        $('#pcpConfirm').addEventListener('click',()=>{
+          App.state.pcpName = App.pcpCandidate.name;
+          App.state.pcpCity = App.pcpCandidate.city;
+          if(App.state.user){
+            App.state.user.pcp = App.state.pcpName;
+            App.state.user.pcpCity = App.state.pcpCity;
+          }
+          App.pcpCandidate = null;
+          if(!alreadyRewarded){
+            App.state.user.journey.m2=true;
+            App.persist();
+            App.celebrate('M2');
+          }else{
+            App.persist();
+            location.hash='#dashboard';
+          }
+        });
+
+        $('#pcpBack').addEventListener('click',()=>{
+          App.pcpCandidate = null;
+          App.route();
+        });
+        return;
+      }
+
       $('#confirm').addEventListener('click',()=>{
-        // ensure PCP info persisted
         if(App.state.pcpName && App.state.pcpCity){
+          if(App.state.user){
+            App.state.user.pcp = App.state.pcpName;
+            App.state.user.pcpCity = App.state.pcpCity;
+          }
           App.persist();
         }
         if(!alreadyRewarded){
@@ -631,9 +762,24 @@ const Views = {
           location.hash='#dashboard';
         }
       });
-      const providers=[{name:'Dr. Lee',specialty:'Family Medicine',city:'Grapevine'},{name:'Dr. Patel',specialty:'Internal Medicine',city:'Dallas'},{name:'Dr. Garcia',specialty:'Family Medicine',city:'Irving'}];
-      const render=q=>{ const wrap=$('#list'); wrap.innerHTML=''; providers.filter(p=>!q||`${p.name} ${p.city}`.toLowerCase().includes(q.toLowerCase())).forEach(p=>{ const d=document.createElement('div'); d.className='card'; d.innerHTML=`<strong>${p.name}</strong><br><small>${p.specialty} • ${p.city}</small><br><button class='btn pick'>${App.t('Select')}</button>`; d.querySelector('.pick').addEventListener('click',()=>{App.state.pcpName=p.name;App.state.pcpCity=p.city;App.persist();if(!alreadyRewarded){App.state.user.journey.m2=true;App.persist();App.celebrate('M2');}else{location.hash='#dashboard';}}); wrap.appendChild(d); }); };
-      render(''); $('#q').addEventListener('input',e=>render(e.target.value));
+
+      const renderList = q=>{
+        const wrap=$('#list');
+        wrap.innerHTML='';
+        providers.filter(p=>!q||`${p.name} ${p.city}`.toLowerCase().includes(q.toLowerCase())).forEach(p=>{
+          const d=document.createElement('div');
+          d.className='card';
+          d.innerHTML=`<strong>${p.name}</strong><br><small>${p.specialty} • ${p.city}</small><br><button class='btn pick'>${App.t('Select')}</button>`;
+          d.querySelector('.pick').addEventListener('click',()=>{
+            App.pcpCandidate = p;
+            App.route();
+          });
+          wrap.appendChild(d);
+        });
+      };
+
+      renderList('');
+      $('#q').addEventListener('input',e=>renderList(e.target.value));
     }
   },
   HRA:{
@@ -732,7 +878,28 @@ const Views = {
     }
   },
   Appointment:{
-    render(){ const a=App.state.appt||{}; const pcpName=App.state.pcpName||''; const pcpCity=App.state.pcpCity||''; const defaultLoc = a.loc||pcpCity;
+    render(){
+      const a = App.state.appt || {};
+      const pcpName = App.state.pcpName || '';
+      const pcpCity = App.state.pcpCity || '';
+      const defaultLoc = a.loc || pcpCity;
+      const candidate = App.tempAppointment;
+
+      if(candidate){
+        return `
+        <section class='card'>
+          <div class='h1'>${App.t('Make Appointment')}</div>
+          <p><strong>${App.t('PCP')}:</strong> ${pcpName}${pcpCity?` (${pcpCity})`:''}</p>
+          <p><strong>${App.t('Date')}:</strong> ${candidate.date}</p>
+          <p><strong>${App.t('Time')}:</strong> ${candidate.time}</p>
+          <p><strong>${App.t('Location / Address')}:</strong> ${candidate.loc}</p>
+          <div class='grid'>
+            <button id='confirmAppointment' class='btn'>${App.t('Confirm')}</button>
+            <button id='editAppointment' class='btn ghost'>${App.t('Back')}</button>
+          </div>
+        </section>`;
+      }
+
       return `
       <section class='card'>
         <div class='h1'>${App.t('Make Appointment')}</div>
@@ -745,7 +912,47 @@ const Views = {
         </form>
       </section>`;
     },
-    bind(){ $('#af').addEventListener('submit',e=>{e.preventDefault();const fd=new FormData(e.target);App.state.appt={date:fd.get('date'),time:fd.get('time'),loc:fd.get('loc'),pcp:App.state.pcpName||'',pcpCity:App.state.pcpCity||''};App.state.user.journey.m4=true;App.persist();App.celebrate('M4');});
+    bind(){
+      const candidate = App.tempAppointment;
+      const alreadyRewarded = !!App.state.user?.journey?.m4;
+
+      if(candidate){
+        $('#confirmAppointment').addEventListener('click',()=>{
+          App.state.appt = candidate;
+          App.state.appt.pcp = App.state.pcpName || '';
+          App.state.appt.pcpCity = App.state.pcpCity || '';
+          App.tempAppointment = null;
+          if(App.state.user){
+            App.state.user.appt = App.state.appt;
+          }
+          if(!alreadyRewarded){
+            App.state.user.journey.m4 = true;
+            App.state.user = App.state.user;
+          }
+          App.state.user.journey.m4 = true;
+          App.persist();
+          App.celebrate('M4');
+        });
+
+        $('#editAppointment').addEventListener('click',()=>{
+          App.tempAppointment = null;
+          App.route();
+        });
+        return;
+      }
+
+      $('#af').addEventListener('submit',e=>{
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        App.tempAppointment = {
+          date: fd.get('date'),
+          time: fd.get('time'),
+          loc: fd.get('loc'),
+          pcp: App.state.pcpName || '',
+          pcpCity: App.state.pcpCity || ''
+        };
+        App.route();
+      });
     }
   },
   AWV:{
